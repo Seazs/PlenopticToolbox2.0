@@ -19,6 +19,8 @@ import json
 import pdb
 import cv2
 import matplotlib.pyplot as plt
+import multiprocessing as mp
+import time
 #import matplotlib.image
 
 
@@ -53,9 +55,34 @@ def estimate_disp(args):
     
     strategy_args = dict()
     selection_strategy = None
-    
+    use_torch = getattr(args, "use_torch", False)
+    torch_device = getattr(args, "torch_device", "auto")
+    torch_interp = getattr(args, "torch_interp", "bilinear")
+    torch_batch = getattr(args, "torch_batch", 1)
+    torch_cache = getattr(args, "torch_cache", False)
+    sgm_only_dp = getattr(args, "sgm_only_dp", False)
+    compute_conf = getattr(args, "compute_conf", True)
+    sgm_workers = getattr(args, "sgm_workers", 0)
+    cost_workers = getattr(args, "cost_workers", 0)
+    timing = getattr(args, "timing", False)
+
+    t_cost_start = time.perf_counter() if timing else None
+
     if args.method == 'plain':
-        fine_costs, coarse_costs, coarse_costs_merged, lens_variance, num_comparisons  = calc_costs_plain(lenses, disparities, nb_offsets, args.max_cost, technique)
+        fine_costs, coarse_costs, coarse_costs_merged, lens_variance, num_comparisons  = calc_costs_plain(
+            lenses,
+            disparities,
+            nb_offsets,
+            args.max_cost,
+            args.technique,
+            hws=args.match_hws,
+            use_torch=use_torch,
+            torch_device=torch_device,
+            torch_interp=torch_interp,
+            torch_batch=torch_batch,
+            torch_cache=torch_cache,
+            num_workers=cost_workers,
+        )
     elif args.method == 'real_lut':
         strategy_args = dict()
         strategy_args['target_lenses'] = _precalc_angular()
@@ -67,7 +94,26 @@ def estimate_disp(args):
     if selection_strategy is not None:
         print("Selection strategy: {0}".format(selection_strategy))
         print("\nStep 1) Calculating the costs..\n")
-        fine_costs, coarse_costs, coarse_costs_merged, lens_variance, num_comparisons, disp_avg = calc_costs_selective_with_lut(lenses, disparities, selection_strategy, args.technique, nb_args=strategy_args, refine=args.refine, max_cost=args.max_cost)
+        fine_costs, coarse_costs, coarse_costs_merged, lens_variance, num_comparisons, disp_avg = calc_costs_selective_with_lut(
+            lenses,
+            disparities,
+            selection_strategy,
+            args.technique,
+            nb_args=strategy_args,
+            refine=args.refine,
+            max_cost=args.max_cost,
+            hws=args.match_hws,
+            use_torch=use_torch,
+            torch_device=torch_device,
+            torch_interp=torch_interp,
+            torch_batch=torch_batch,
+            torch_cache=torch_cache,
+            num_workers=cost_workers,
+        )
+
+    if timing:
+        t_cost_end = time.perf_counter()
+        print("Timing: cost volume {:.2f}s".format(t_cost_end - t_cost_start))
 
     if args.coarse is True:
         coarse_disp = regularize_coarse(lenses, coarse_costs_merged, disparities, penalty1=args.coarse_penalty1, penalty2=args.coarse_penalty2)
@@ -75,7 +121,23 @@ def estimate_disp(args):
     
     #pdb.set_trace()
     print("\nStep 2) Regularizing and extracing disparity map..\n")
-    fine_disps, fine_disps_interp, fine_val, wta_depths, wta_depths_interp, wta_val, confidence = regularized_fine(lenses, fine_costs, disparities, args.penalty1, args.penalty2, args.max_cost, conf_tec=args.confidence_technique, conf_sigma=args.conf_sigma)
+    t_reg_start = time.perf_counter() if timing else None
+    fine_disps, fine_disps_interp, fine_val, wta_depths, wta_depths_interp, wta_val, confidence = regularized_fine(
+        lenses,
+        fine_costs,
+        disparities,
+        args.penalty1,
+        args.penalty2,
+        args.max_cost,
+        conf_tec=args.confidence_technique,
+        conf_sigma=args.conf_sigma,
+        only_dp=sgm_only_dp,
+        compute_conf=compute_conf,
+        num_workers=sgm_workers,
+    )
+    if timing:
+        t_reg_end = time.perf_counter()
+        print("Timing: SGM + labels {:.2f}s".format(t_reg_end - t_reg_start))
        
     Dsgm = rtxrender.render_lens_imgs(lenses, fine_disps_interp)
     Dwta = rtxrender.render_lens_imgs(lenses, wta_depths_interp)
@@ -795,7 +857,21 @@ def fixed_selection_strategy_14():
                 
     return [offset for offset in nb_offsets]  
 
-def calc_costs_plain(lenses, disparities, nb_offsets, max_cost, progress_hook=print):
+def calc_costs_plain(
+    lenses,
+    disparities,
+    nb_offsets,
+    max_cost,
+    technique,
+    hws=1,
+    progress_hook=print,
+    use_torch=False,
+    torch_device="auto",
+    torch_interp="bilinear",
+    torch_batch=1,
+    torch_cache=False,
+    num_workers=0,
+):
     
     coarse_costs = dict()
     coarse_costs_merged = dict()
@@ -805,6 +881,9 @@ def calc_costs_plain(lenses, disparities, nb_offsets, max_cost, progress_hook=pr
     num_lenses = len(lenses)
     num_comparisons = 0
     
+    if num_workers is not None and num_workers > 1:
+        progress_hook("Parallel cost volume is not enabled for method 'plain'; using single process.")
+
     for i, lcoord in enumerate(lenses):
         nb_lenses = _rel_to_abs(lcoord, lenses, nb_offsets)
         lens = lenses[lcoord]
@@ -812,7 +891,19 @@ def calc_costs_plain(lenses, disparities, nb_offsets, max_cost, progress_hook=pr
         if i%5000==0:
             progress_hook("Processing lens {0}/{1} Coord: {2}".format(i, num_lenses, lcoord))
 
-        fine, coarse, coarse_merged, lens_var = calc_costs_per_lens(lens, nb_lenses, disparities,  max_cost, method)
+        fine, coarse, coarse_merged, lens_var = calc_costs_per_lens(
+            lens,
+            nb_lenses,
+            disparities,
+            max_cost,
+            technique,
+            hws=hws,
+            use_torch=use_torch,
+            torch_device=torch_device,
+            torch_interp=torch_interp,
+            torch_batch=torch_batch,
+            torch_cache=torch_cache,
+        )
         
         coarse_costs_merged[lcoord] = coarse_merged
         coarse_costs[lcoord] = coarse
@@ -838,7 +929,387 @@ def regularize_coarse(lenses, coarse_costs, disparities, penalty1=0.08, penalty2
         coarse_disp[lcoord], _ = rtxdisp.cost_minimum_interp(sgm_cost[lcoord], disparities)
     return coarse_disp
 
-def regularized_fine(lenses, fine_costs, disp, penalty1, penalty2, max_cost, conf_tec='mlm', conf_sigma=0.3, min_thresh=2.0, eps=0.0000001):
+
+_SGM_LENSES = None
+_SGM_FINE_COSTS = None
+_SGM_DISP = None
+_SGM_PENALTY1 = None
+_SGM_PENALTY2 = None
+_SGM_MAX_COST = None
+_SGM_CONF_TEC = None
+_SGM_CONF_SIGMA = None
+_SGM_ONLY_DP = None
+_SGM_COMPUTE_CONF = None
+_SGM_MIN_THRESH = None
+_SGM_EPS = None
+
+_COST_LENSES = None
+_COST_DISPARITIES = None
+_COST_MAX_COST = None
+_COST_TECHNIQUE = None
+_COST_HWS = None
+_COST_USE_TORCH = None
+_COST_TORCH_DEVICE = None
+_COST_TORCH_INTERP = None
+_COST_TORCH_BATCH = None
+_COST_TORCH_CACHE = None
+_COST_NB_OFFSETS = None
+_COST_REFINE = None
+_COST_NB_STRATEGY = None
+_COST_NB_ARGS = None
+
+
+def _sgm_worker_init(
+    lenses,
+    fine_costs,
+    disp,
+    penalty1,
+    penalty2,
+    max_cost,
+    conf_tec,
+    conf_sigma,
+    only_dp,
+    compute_conf,
+    min_thresh,
+    eps,
+):
+
+    global _SGM_LENSES
+    global _SGM_FINE_COSTS
+    global _SGM_DISP
+    global _SGM_PENALTY1
+    global _SGM_PENALTY2
+    global _SGM_MAX_COST
+    global _SGM_CONF_TEC
+    global _SGM_CONF_SIGMA
+    global _SGM_ONLY_DP
+    global _SGM_COMPUTE_CONF
+    global _SGM_MIN_THRESH
+    global _SGM_EPS
+
+    _SGM_LENSES = lenses
+    _SGM_FINE_COSTS = fine_costs
+    _SGM_DISP = disp
+    _SGM_PENALTY1 = penalty1
+    _SGM_PENALTY2 = penalty2
+    _SGM_MAX_COST = max_cost
+    _SGM_CONF_TEC = conf_tec
+    _SGM_CONF_SIGMA = conf_sigma
+    _SGM_ONLY_DP = only_dp
+    _SGM_COMPUTE_CONF = compute_conf
+    _SGM_MIN_THRESH = min_thresh
+    _SGM_EPS = eps
+
+
+def _cost_plain_worker_init(
+    lenses,
+    disparities,
+    nb_offsets,
+    max_cost,
+    technique,
+    hws,
+    use_torch,
+    torch_device,
+    torch_interp,
+    torch_batch,
+    torch_cache,
+):
+
+    global _COST_LENSES
+    global _COST_DISPARITIES
+    global _COST_MAX_COST
+    global _COST_TECHNIQUE
+    global _COST_HWS
+    global _COST_USE_TORCH
+    global _COST_TORCH_DEVICE
+    global _COST_TORCH_INTERP
+    global _COST_TORCH_BATCH
+    global _COST_TORCH_CACHE
+    global _COST_NB_OFFSETS
+
+    _COST_LENSES = lenses
+    _COST_DISPARITIES = disparities
+    _COST_MAX_COST = max_cost
+    _COST_TECHNIQUE = technique
+    _COST_HWS = hws
+    _COST_USE_TORCH = use_torch
+    _COST_TORCH_DEVICE = torch_device
+    _COST_TORCH_INTERP = torch_interp
+    _COST_TORCH_BATCH = torch_batch
+    _COST_TORCH_CACHE = torch_cache
+    _COST_NB_OFFSETS = nb_offsets
+
+
+def _cost_selective_worker_init(
+    lenses,
+    disparities,
+    nb_strategy,
+    nb_args,
+    max_cost,
+    technique,
+    hws,
+    refine,
+    use_torch,
+    torch_device,
+    torch_interp,
+    torch_batch,
+    torch_cache,
+):
+
+    global _COST_LENSES
+    global _COST_DISPARITIES
+    global _COST_MAX_COST
+    global _COST_TECHNIQUE
+    global _COST_HWS
+    global _COST_USE_TORCH
+    global _COST_TORCH_DEVICE
+    global _COST_TORCH_INTERP
+    global _COST_TORCH_BATCH
+    global _COST_TORCH_CACHE
+    global _COST_REFINE
+    global _COST_NB_STRATEGY
+    global _COST_NB_ARGS
+
+    _COST_LENSES = lenses
+    _COST_DISPARITIES = disparities
+    _COST_MAX_COST = max_cost
+    _COST_TECHNIQUE = technique
+    _COST_HWS = hws
+    _COST_USE_TORCH = use_torch
+    _COST_TORCH_DEVICE = torch_device
+    _COST_TORCH_INTERP = torch_interp
+    _COST_TORCH_BATCH = torch_batch
+    _COST_TORCH_CACHE = torch_cache
+    _COST_REFINE = refine
+    _COST_NB_STRATEGY = nb_strategy
+    _COST_NB_ARGS = nb_args
+
+
+def _cost_plain_worker(lcoord):
+
+    lens = _COST_LENSES[lcoord]
+    nb_lenses = _rel_to_abs(lcoord, _COST_LENSES, _COST_NB_OFFSETS)
+    fine, coarse, coarse_merged, lens_var = calc_costs_per_lens(
+        lens,
+        nb_lenses,
+        _COST_DISPARITIES,
+        _COST_MAX_COST,
+        _COST_TECHNIQUE,
+        hws=_COST_HWS,
+        use_torch=_COST_USE_TORCH,
+        torch_device=_COST_TORCH_DEVICE,
+        torch_interp=_COST_TORCH_INTERP,
+        torch_batch=_COST_TORCH_BATCH,
+        torch_cache=_COST_TORCH_CACHE,
+    )
+
+    fine_merged = np.array(rtxdisp.merge_costs_additive(fine, _COST_MAX_COST))
+    rtxdisp.assign_last_valid(fine_merged)
+
+    return lcoord, fine_merged, coarse, coarse_merged, lens_var, len(fine)
+
+
+def _cost_selective_worker(lcoord):
+
+    lens = _COST_LENSES[lcoord]
+
+    pos1 = [[-1, -1], [-1, 2], [1, 1], [1, -2], [0, -1], [0, 1]]
+    pos2 = [[-1, -1], [-2, 1], [1, 1], [2, -1], [0, -1], [0, 1]]
+    pos3 = [[-2, 1], [-1, 2], [2, -1], [1, -2], [0, -1], [0, 1]]
+
+    if rtxhexgrid.hex_focal_type(lcoord) == 0:
+        pos = rtxhexgrid.HEX_OFFSETS[1]
+    elif rtxhexgrid.hex_focal_type(lcoord) == 1:
+        pos = pos1
+    elif rtxhexgrid.hex_focal_type(lcoord) == 2:
+        pos = pos1
+    else:
+        pdb.set_trace()
+
+    nb_lenses = _rel_to_abs(lcoord, _COST_LENSES, pos)
+
+    fine, coarse, coarse_merged, lens_var = calc_costs_per_lens(
+        lens,
+        nb_lenses,
+        _COST_DISPARITIES,
+        _COST_MAX_COST,
+        _COST_TECHNIQUE,
+        hws=_COST_HWS,
+        use_torch=_COST_USE_TORCH,
+        torch_device=_COST_TORCH_DEVICE,
+        torch_interp=_COST_TORCH_INTERP,
+        torch_batch=_COST_TORCH_BATCH,
+        torch_cache=_COST_TORCH_CACHE,
+    )
+
+    nb_offsets, curr_disp_avg = _COST_NB_STRATEGY(
+        lens,
+        _COST_LENSES,
+        coarse,
+        _COST_DISPARITIES,
+        max_cost=_COST_MAX_COST,
+        nb_args=_COST_NB_ARGS,
+    )
+
+    nb_lenses = _rel_to_abs(lcoord, _COST_LENSES, nb_offsets)
+    if len(nb_lenses) > 0:
+        fine_2, coarse_2, _, _ = calc_costs_per_lens(
+            lens,
+            nb_lenses,
+            _COST_DISPARITIES,
+            _COST_MAX_COST,
+            _COST_TECHNIQUE,
+            hws=_COST_HWS,
+            use_torch=_COST_USE_TORCH,
+            torch_device=_COST_TORCH_DEVICE,
+            torch_interp=_COST_TORCH_INTERP,
+            torch_batch=_COST_TORCH_BATCH,
+            torch_cache=_COST_TORCH_CACHE,
+        )
+
+        if _COST_REFINE is True:
+            fine = np.append(fine, fine_2, axis=0)
+            coarse = np.append(coarse, coarse_2, axis=0)
+        else:
+            fine = fine_2
+            coarse = coarse_2
+
+    num_targets = len(fine)
+    coarse_merged = rtxdisp.merge_costs_additive(coarse, _COST_MAX_COST)
+    fine_merged = np.array(rtxdisp.merge_costs_additive(fine, _COST_MAX_COST))
+
+    return lcoord, fine_merged, coarse, coarse_merged, lens_var, num_targets
+
+
+def _regularized_single(
+    lcoord,
+    lens,
+    fine_cost,
+    disp,
+    penalty1,
+    penalty2,
+    max_cost,
+    conf_tec,
+    conf_sigma,
+    only_dp,
+    compute_conf,
+    min_thresh,
+    eps,
+):
+
+    F = np.flipud(np.rot90(fine_cost.T))
+
+    sgm_cost = rtxsgm.sgm(lens.img, F, lens.mask, penalty1, penalty2, only_dp, max_cost)
+
+    fine_depth = np.argmin(sgm_cost, axis=2)
+    fine_depth_interp, fine_depth_val = rtxdisp.cost_minima_interp(sgm_cost, disp)
+
+    wta_depth = np.argmin(F, axis=2)
+    wta_depth_interp, wta_depth_val = rtxdisp.cost_minima_interp(F, disp)
+
+    fine_depth_val = wta_depth_val
+
+    if not compute_conf:
+        confidence = np.zeros_like(lens.img)
+        return (
+            lcoord,
+            fine_depth,
+            fine_depth_interp,
+            fine_depth_val,
+            wta_depth,
+            wta_depth_interp,
+            wta_depth_val,
+            confidence,
+        )
+
+    minimum_costs = np.min(sgm_cost, axis=2)
+
+    if conf_tec == 'oev':
+        num_denom = 0
+        dmax = np.max(sgm_cost)
+        dmin = np.min(sgm_cost)
+        denom_denom = max(sgm_cost - minimum_costs[:, :, None], 1)
+        for n in range(0, sgm_cost.shape[2]):
+            index_map = np.ones((sgm_cost.shape[0], sgm_cost.shape[1])) * n
+            tmp_num = np.pow(max(min(index_map - fine_depth, (dmax - dmin) / 3), 0), 2)
+            num_denom += tmp_num / denom_denom[:, :, n]
+        confidence = 1 / num_denom
+    elif conf_tec == 'rtvbf':
+        confidence = np.sum(np.exp(-((sgm_cost - fine_depth_val[:, :, None]) ** 2) / conf_sigma), axis=2) - 1
+
+        ind = confidence > eps
+        confidence[confidence <= 0] = 0.0
+        confidence[ind] = 1.0 / confidence[ind]
+    else:
+        # numerically stable MLM: factor out minimum cost to avoid overflow
+        scaled = -(sgm_cost - minimum_costs[:, :, None]) / (2 * np.power(conf_sigma, 2))
+        denom_cost = np.sum(np.exp(scaled), axis=2)
+        denom_cost[denom_cost == 0] = np.inf
+        confidence = 1.0 / denom_cost
+        confidence[np.isnan(confidence)] = 0
+
+    return (
+        lcoord,
+        fine_depth,
+        fine_depth_interp,
+        fine_depth_val,
+        wta_depth,
+        wta_depth_interp,
+        wta_depth_val,
+        confidence,
+    )
+
+
+def _sgm_worker(lcoord):
+
+    lens = _SGM_LENSES[lcoord]
+    fine_cost = _SGM_FINE_COSTS[lcoord]
+    return _regularized_single(
+        lcoord,
+        lens,
+        fine_cost,
+        _SGM_DISP,
+        _SGM_PENALTY1,
+        _SGM_PENALTY2,
+        _SGM_MAX_COST,
+        _SGM_CONF_TEC,
+        _SGM_CONF_SIGMA,
+        _SGM_ONLY_DP,
+        _SGM_COMPUTE_CONF,
+        _SGM_MIN_THRESH,
+        _SGM_EPS,
+    )
+
+
+def _get_mp_context():
+
+    try:
+        return mp.get_context("fork")
+    except ValueError:
+        return mp.get_context("spawn")
+
+
+def _calc_chunksize(num_items, num_workers):
+
+    if num_items == 0:
+        return 1
+    return max(1, num_items // (num_workers * 4))
+
+def regularized_fine(
+    lenses,
+    fine_costs,
+    disp,
+    penalty1,
+    penalty2,
+    max_cost,
+    conf_tec='mlm',
+    conf_sigma=0.3,
+    min_thresh=2.0,
+    eps=0.0000001,
+    only_dp=False,
+    compute_conf=True,
+    num_workers=0,
+):
 
     fine_depths = dict()
     fine_depths_interp = dict()
@@ -849,79 +1320,132 @@ def regularized_fine(lenses, fine_costs, disp, penalty1, penalty2, max_cost, con
     num_lenses = len(lenses)
     confidence = dict()
     
-    for i, l in enumerate(fine_costs):
-        
-        if i%100==0:
-            print("Regularization: Processing lens {:05d}/{:05d}".format(i, num_lenses), end="\r", flush=True)
-        lens = lenses[l]
+    if num_workers is None or num_workers <= 1:
+        for i, l in enumerate(fine_costs):
+            if i % 100 == 0:
+                print("Regularization: Processing lens {:05d}/{:05d}".format(i, num_lenses), end="\r", flush=True)
 
-        # prepare the cost shape: disparity axis is third axis (index [2] instead of [0])
-        F = np.flipud(np.rot90(fine_costs[l].T))
+            lens = lenses[l]
+            result = _regularized_single(
+                l,
+                lens,
+                fine_costs[l],
+                disp,
+                penalty1,
+                penalty2,
+                max_cost,
+                conf_tec,
+                conf_sigma,
+                only_dp,
+                compute_conf,
+                min_thresh,
+                eps,
+            )
+            (
+                lcoord,
+                fine_depth,
+                fine_depth_interp,
+                fine_depth_val,
+                wta_depth,
+                wta_depth_interp,
+                wta_depth_val,
+                conf,
+            ) = result
 
-        # the regularized cost volume
-        sgm_cost = rtxsgm.sgm(lenses[l].img, F, lens.mask, penalty1, penalty2, False, max_cost)
-        
-        # plain minima
-        fine_depths[l] = np.argmin(sgm_cost, axis=2)
-        
-        # interpolated minima and values
-        fine_depths_interp[l], fine_depths_val[l] = rtxdisp.cost_minima_interp(sgm_cost, disp)
+            fine_depths[lcoord] = fine_depth
+            fine_depths_interp[lcoord] = fine_depth_interp
+            fine_depths_val[lcoord] = fine_depth_val
+            wta_depths[lcoord] = wta_depth
+            wta_depths_interp[lcoord] = wta_depth_interp
+            wta_depths_val[lcoord] = wta_depth_val
+            confidence[lcoord] = conf
+    else:
+        keys = list(fine_costs.keys())
+        num_workers = min(int(num_workers), len(keys))
+        if num_workers <= 1:
+            return regularized_fine(
+                lenses,
+                fine_costs,
+                disp,
+                penalty1,
+                penalty2,
+                max_cost,
+                conf_tec=conf_tec,
+                conf_sigma=conf_sigma,
+                min_thresh=min_thresh,
+                eps=eps,
+                only_dp=only_dp,
+                compute_conf=compute_conf,
+                num_workers=0,
+            )
 
-        #if i%1000==0:
-        #    print("max interp: {0}".format(np.amax(fine_depths_interp[l])))
+        ctx = _get_mp_context()
+        chunksize = _calc_chunksize(len(keys), num_workers)
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=_sgm_worker_init,
+            initargs=(
+                lenses,
+                fine_costs,
+                disp,
+                penalty1,
+                penalty2,
+                max_cost,
+                conf_tec,
+                conf_sigma,
+                only_dp,
+                compute_conf,
+                min_thresh,
+                eps,
+            ),
+        ) as pool:
+            for idx, result in enumerate(pool.imap_unordered(_sgm_worker, keys, chunksize=chunksize), 1):
+                (
+                    lcoord,
+                    fine_depth,
+                    fine_depth_interp,
+                    fine_depth_val,
+                    wta_depth,
+                    wta_depth_interp,
+                    wta_depth_val,
+                    conf,
+                ) = result
 
-        # plain winner takes all minima
-        wta_depths[l] = np.argmin(F, axis=2)
-        
-        # interpolated minima and values from the unregularized cost volume
-        wta_depths_interp[l], wta_depths_val[l] = rtxdisp.cost_minima_interp(F, disp)
+                fine_depths[lcoord] = fine_depth
+                fine_depths_interp[lcoord] = fine_depth_interp
+                fine_depths_val[lcoord] = fine_depth_val
+                wta_depths[lcoord] = wta_depth
+                wta_depths_interp[lcoord] = wta_depth_interp
+                wta_depths_val[lcoord] = wta_depth_val
+                confidence[lcoord] = conf
 
-        fine_depths_val[l] = wta_depths_val[l]
-        ### CALCULATE THE CONFIDENCE USING A METHOD
-        minimum_costs = np.min(sgm_cost, axis=2)
-
-        #pdb.set_trace()
-        if conf_tec == 'oev':
-            # TODO max does not work on arrays
-            num_denom = 0
-            dmax = np.max(sgm_cost)
-            dmin = np.min(sgm_cost)
-            denom_denom = max(sgm_cost - minimum_costs[:,:,None], 1)
-            for n in range(0, sgm_cost.shape[2]):
-                index_map = np.ones((sgm_cost.shape[0], sgm_cost.shape[1])) * n
-                tmp_num = np.pow(max(min(index_map - fine_depths[l], (dmax - dmin)/3), 0), 2)
-                num_denom += tmp_num / denom_denom[:,:,n]
-            confidence[l] = 1 / num_denom
-        elif conf_tec == 'rtvbf':
-            confidence[l] = np.sum(np.exp(-((sgm_cost - fine_depths_val[l][:, :, None])**2) / conf_sigma), axis=2) - 1
-            # confidence measure used in "Real-Time Visibility-Based Fusion of Depth Maps"
-            # substract 1 at the end since the "real" optimium is included in the vectorized operations
-
-            # confidence[l][fine_depths_val[l] > min_thresh] = 0.0
-            #TODO: calculate wta confidence, scale the sigma accordingly
-            #confidence[l] = np.sum(np.exp(-((F - wta_depths_val[l][:, :, None])**2) / conf_sigma), axis=2) - 1
-            
-            # avoid overflow in division
-            ind = confidence[l] > eps
-            confidence[l][confidence[l] <= 0] = 0.0
-            confidence[l][ind] = 1.0 / confidence[l][ind]
-        else: 
-            # TODO
-            # check overflow in exp 
-            # and division for zero
-            #conf_tec == 'mlm':
-            exp_cost = np.exp(-minimum_costs/(2*np.power(conf_sigma,2)))
-            denom_cost = np.sum(np.exp(-sgm_cost/(2*np.power(conf_sigma,2))), axis=2)
-            #zeros = denom_cost == 0
-            #denom_cost = denom_cost + zeros * np.max(denom_cost)
-            confidence_map = exp_cost / denom_cost
-            confidence_map[np.isnan(confidence_map)] = 0
-            confidence[l] = confidence_map
+                if idx % 100 == 0 or idx == num_lenses:
+                    print(
+                        "Regularization: Processing lens {:05d}/{:05d}".format(idx, num_lenses),
+                        end="\r",
+                        flush=True,
+                    )
 
     print("\nDone!")
     return fine_depths, fine_depths_interp, fine_depths_val, wta_depths, wta_depths_interp, wta_depths_val, confidence
     
-def calc_costs_selective_with_lut(lenses, disparities, nb_strategy, technique, nb_args, max_cost, refine=True, progress_hook=print):
+def calc_costs_selective_with_lut(
+    lenses,
+    disparities,
+    nb_strategy,
+    technique,
+    nb_args,
+    max_cost,
+    refine=True,
+    hws=1,
+    progress_hook=print,
+    use_torch=False,
+    torch_device="auto",
+    torch_interp="bilinear",
+    torch_batch=1,
+    torch_cache=False,
+    num_workers=0,
+):
     
     """
     it firstly calculates the fine and coarse depth map based on the first "circle" (HEX_OFFSETS[1]) with lenses of same focal lens
@@ -945,65 +1469,200 @@ def calc_costs_selective_with_lut(lenses, disparities, nb_strategy, technique, n
     pos2 = [[-1,-1],[-2,1],[1,1],[2,-1],[0,-1],[0,1]]
     pos3 = [[-2,1],[-1,2],[2,-1],[1,-2],[0,-1],[0,1]]
 
-    for i, lcoord in enumerate(lenses):
-        
-        lens = lenses[lcoord]
-        
-        # some lenses have troubles, mainly the 0-type lenses, when they are far away
-        # using this solution seems better   
-        if rtxhexgrid.hex_focal_type(lcoord)==0:
-            pos = rtxhexgrid.HEX_OFFSETS[1]
-        elif rtxhexgrid.hex_focal_type(lcoord)==1:
-            pos = pos1
-        elif rtxhexgrid.hex_focal_type(lcoord)==2:
-            pos = pos1
-        else:
-            pdb.set_trace()
-            
-        nb_lenses = _rel_to_abs(lcoord, lenses, pos)
-       
-        
-        if i % 100 == 0:
-            print("Building Cost Volume: processing microlens {:05d}/{:05d}".format(i, num_lenses), end="\r", flush=True)
-        
-        
-        # calculate a first guess of the disparity based on the first circle
-        fine, coarse, coarse_merged, lens_var = calc_costs_per_lens(lens, nb_lenses, disparities, max_cost, technique)
-        nb_offsets, curr_disp_avg = nb_strategy(lens, lenses, coarse, disparities, max_cost=max_cost, nb_args=nb_args)
-        
-        nb_lenses = _rel_to_abs(lcoord, lenses, nb_offsets)
+    if num_workers is None or num_workers <= 1:
+        for i, lcoord in enumerate(lenses):
+            lens = lenses[lcoord]
 
-        if len(nb_lenses) > 0:
-            
-            #progress_hook("Refined nb: {0}".format(nb_offsets))
-            fine_2, coarse_2, _, _ = calc_costs_per_lens(lens, nb_lenses, disparities, max_cost, technique)
-
-            if refine is True:
-                fine = np.append(fine, fine_2, axis=0)
-                coarse = np.append(coarse, coarse_2, axis=0)
+            # some lenses have troubles, mainly the 0-type lenses, when they are far away
+            # using this solution seems better
+            if rtxhexgrid.hex_focal_type(lcoord) == 0:
+                pos = rtxhexgrid.HEX_OFFSETS[1]
+            elif rtxhexgrid.hex_focal_type(lcoord) == 1:
+                pos = pos1
+            elif rtxhexgrid.hex_focal_type(lcoord) == 2:
+                pos = pos1
             else:
-                fine = fine_2
-                coarse = coarse_2
+                pdb.set_trace()
 
-        num_targets += len(fine)  
-        # coarse_costs_merged[lcoord].shape = [numdisp, ]
-        coarse_costs_merged[lcoord]  =  rtxdisp.merge_costs_additive(coarse, max_cost)
-        # coarse_costs[lcoord].shape = [2 * len(nb_lenses), numdisp]
-        #                           if refine is False, [len(nb_lenses), numdisp]
-        #                           len(fine) can be used!
-        coarse_costs[lcoord] = coarse
-        #fine_costs[lcoord].shape = [numdisp, imgside, imgside]
-        fine_costs[lcoord] = np.array(rtxdisp.merge_costs_additive(fine, max_cost))
-    
-        lens_std[lcoord] = lens_var
+            nb_lenses = _rel_to_abs(lcoord, lenses, pos)
+
+            if i % 100 == 0:
+                print("Building Cost Volume: processing microlens {:05d}/{:05d}".format(i, num_lenses), end="\r", flush=True)
+
+            # calculate a first guess of the disparity based on the first circle
+            fine, coarse, coarse_merged, lens_var = calc_costs_per_lens(
+                lens,
+                nb_lenses,
+                disparities,
+                max_cost,
+                technique,
+                hws=hws,
+                use_torch=use_torch,
+                torch_device=torch_device,
+                torch_interp=torch_interp,
+                torch_batch=torch_batch,
+                torch_cache=torch_cache,
+            )
+            nb_offsets, curr_disp_avg = nb_strategy(lens, lenses, coarse, disparities, max_cost=max_cost, nb_args=nb_args)
+
+            nb_lenses = _rel_to_abs(lcoord, lenses, nb_offsets)
+
+            if len(nb_lenses) > 0:
+                fine_2, coarse_2, _, _ = calc_costs_per_lens(
+                    lens,
+                    nb_lenses,
+                    disparities,
+                    max_cost,
+                    technique,
+                    hws=hws,
+                    use_torch=use_torch,
+                    torch_device=torch_device,
+                    torch_interp=torch_interp,
+                    torch_batch=torch_batch,
+                    torch_cache=torch_cache,
+                )
+
+                if refine is True:
+                    fine = np.append(fine, fine_2, axis=0)
+                    coarse = np.append(coarse, coarse_2, axis=0)
+                else:
+                    fine = fine_2
+                    coarse = coarse_2
+
+            num_targets += len(fine)
+            coarse_costs_merged[lcoord] = rtxdisp.merge_costs_additive(coarse, max_cost)
+            coarse_costs[lcoord] = coarse
+            fine_costs[lcoord] = np.array(rtxdisp.merge_costs_additive(fine, max_cost))
+
+            lens_std[lcoord] = lens_var
+    else:
+        ctx = _get_mp_context()
+        if ctx.get_start_method() != "fork":
+            progress_hook("Parallel cost volume requires fork; falling back to single process.")
+            return calc_costs_selective_with_lut(
+                lenses,
+                disparities,
+                nb_strategy,
+                technique,
+                nb_args,
+                max_cost,
+                refine=refine,
+                hws=hws,
+                progress_hook=progress_hook,
+                use_torch=use_torch,
+                torch_device=torch_device,
+                torch_interp=torch_interp,
+                torch_batch=torch_batch,
+                torch_cache=torch_cache,
+                num_workers=0,
+            )
+
+        if use_torch:
+            progress_hook("Torch backend disabled for parallel cost volume. Use --cost_workers 0 to keep GPU sweep.")
+            use_torch = False
+
+        keys = list(lenses.keys())
+        num_workers = min(int(num_workers), len(keys))
+        if num_workers <= 1:
+            return calc_costs_selective_with_lut(
+                lenses,
+                disparities,
+                nb_strategy,
+                technique,
+                nb_args,
+                max_cost,
+                refine=refine,
+                hws=hws,
+                progress_hook=progress_hook,
+                use_torch=use_torch,
+                torch_device=torch_device,
+                torch_interp=torch_interp,
+                torch_batch=torch_batch,
+                torch_cache=torch_cache,
+                num_workers=0,
+            )
+
+        chunksize = _calc_chunksize(len(keys), num_workers)
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=_cost_selective_worker_init,
+            initargs=(
+                lenses,
+                disparities,
+                nb_strategy,
+                nb_args,
+                max_cost,
+                technique,
+                hws,
+                refine,
+                use_torch,
+                torch_device,
+                torch_interp,
+                torch_batch,
+                torch_cache,
+            ),
+        ) as pool:
+            for idx, result in enumerate(pool.imap_unordered(_cost_selective_worker, keys, chunksize=chunksize), 1):
+                lcoord, fine_merged, coarse, coarse_merged, lens_var, targets = result
+                fine_costs[lcoord] = fine_merged
+                coarse_costs[lcoord] = coarse
+                coarse_costs_merged[lcoord] = coarse_merged
+                lens_std[lcoord] = lens_var
+                num_targets += targets
+
+                if idx % 100 == 0 or idx == num_lenses:
+                    print(
+                        "Building Cost Volume: processing microlens {:05d}/{:05d}".format(idx, num_lenses),
+                        end="\r",
+                        flush=True,
+                    )
 
     print("\nDone!\nNum comparisons: {0}\n".format(num_targets))
     
     return fine_costs, coarse_costs, coarse_costs_merged, lens_std, num_targets, 0.0   
    
-def calc_costs_per_lens(lens, nb_lenses, disparities, max_cost, technique):
+def calc_costs_per_lens(
+    lens,
+    nb_lenses,
+    disparities,
+    max_cost,
+    technique,
+    hws=1,
+    use_torch=False,
+    torch_device="auto",
+    torch_interp="bilinear",
+    torch_batch=1,
+    torch_cache=False,
+):
 
-    cost, img, d = rtxdisp.lens_sweep(lens, nb_lenses, disparities, technique, max_cost=max_cost)
+    if use_torch and technique in ("sad", "ssd"):
+        if torch_batch is not None and int(torch_batch) > 1:
+            cost, img, d = rtxdisp.lens_sweep_torch_batched(
+                lens,
+                nb_lenses,
+                disparities,
+                technique,
+                hws=hws,
+                max_cost=max_cost,
+                device=torch_device,
+                interp=torch_interp,
+                batch_neighbors=int(torch_batch),
+                cache_images=torch_cache,
+            )
+        else:
+            cost, img, d = rtxdisp.lens_sweep_torch(
+                lens,
+                nb_lenses,
+                disparities,
+                technique,
+                hws=hws,
+                max_cost=max_cost,
+                device=torch_device,
+                interp=torch_interp,
+                cache_images=torch_cache,
+            )
+    else:
+        cost, img, d = rtxdisp.lens_sweep(lens, nb_lenses, disparities, technique, hws=hws, max_cost=max_cost)
     coarse_costs = rtxdisp.sweep_to_shift_costs(cost, max_cost)
     coarse_costs_merged = rtxdisp.merge_costs_additive(coarse_costs, max_cost)
     lens_std = np.std(lens.img[lens.mask > 0])
@@ -1018,8 +1677,8 @@ class EvalParameters(object):
         self.min_disp_fac = 0.02 
         self.max_ring = 7
         self.max_cost = 10.0
-        self.penalty1 = 0.01 
-        self.penalty2 = 0.03 
+        self.penalty1 = 0.1
+        self.penalty2 = 0.4
         self.method = 'plain'
         self.use_rings = '0,1'
         self.refine = True
@@ -1027,6 +1686,7 @@ class EvalParameters(object):
         self.conf_sigma = 0.2
         self.max_conf = 2.0
         self.filename = None
+        self.match_hws = 1
         self.coarse = False
         self.coarse_weight = 0.01
         self.struct_var = 0.01
@@ -1041,3 +1701,13 @@ class EvalParameters(object):
         self.maskpath = ''
         self.disppath = ''
         self.colorimagepath = ''
+        self.use_torch = False
+        self.torch_device = 'auto'
+        self.torch_interp = 'bilinear'
+        self.torch_batch = 1
+        self.torch_cache = False
+        self.sgm_only_dp = False
+        self.compute_conf = True
+        self.timing = False
+        self.sgm_workers = 0
+        self.cost_workers = 0

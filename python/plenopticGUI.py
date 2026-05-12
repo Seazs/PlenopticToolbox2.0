@@ -11,8 +11,8 @@ from tkinter import *
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import matplotlib.backends.tkagg as tkagg
-#from matplotlib.backends.backend_agg import FigureCanvasAgg
+import matplotlib.backends.backend_tkagg as tkagg
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 #from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
 import pdb
 import numpy as np
